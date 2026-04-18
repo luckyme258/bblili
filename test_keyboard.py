@@ -9,6 +9,8 @@ import requests
 import re
 import shutil
 import os
+import signal
+import time
 from typing import List, Dict, Optional, Tuple
 
 # ========== 调试输出 ==========
@@ -28,12 +30,23 @@ def check_dependencies() -> Tuple[bool, str]:
     except ImportError:
         return False, "未安装 yt-dlp，请运行: pip install yt-dlp"
 
+# ========== 读取资源库文件 ==========
+def load_playlist(file_path: str = "playlist.txt") -> List[Tuple[str, str]]:
+    if not os.path.exists(file_path):
+        return []
+    entries = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '*' in line:
+                name, url = line.split('*', 1)
+                entries.append((name.strip(), url.strip()))
+    return entries
+
 # ========== B站 API 获取分P列表 ==========
 def get_video_pages_from_api(bvid: str) -> Optional[List[Tuple[str, int, str]]]:
-    """
-    通过 B 站 API 获取视频的分 P 列表
-    返回: [(标题, 页码, 播放链接), ...] 或 None
-    """
     api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -143,27 +156,35 @@ def build_mpv_command(url: str, format_id: str, strategy: Dict) -> List[str]:
     debug_print(f"mpv 命令: {' '.join(cmd)}")
     return cmd
 
-def play_with_mpv(url: str, strategy: Dict, status_callback=None) -> Optional[str]:
+def play_with_mpv(url: str, strategy: Dict, status_callback=None) -> Optional[subprocess.Popen]:
+    """
+    启动 mpv 播放，返回 Popen 对象（用于后续杀死）
+    如果失败返回 None
+    """
     if status_callback:
         status_callback("正在选择最佳格式...")
     format_id = get_best_format_id(url, strategy, status_callback)
     if not format_id:
-        return "无法获取可用的视频格式"
+        if status_callback:
+            status_callback("无法获取可用的视频格式")
+        return None
     cmd = build_mpv_command(url, format_id, strategy)
     try:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if status_callback:
             status_callback("mpv 播放器已启动")
-        return None
+        return proc
     except Exception as e:
-        return f"启动 mpv 失败: {e}"
+        if status_callback:
+            status_callback(f"启动 mpv 失败: {e}")
+        return None
 
 # ========== GUI 程序 ==========
 class BiliPlayer:
     def __init__(self, root):
         self.root = root
-        self.root.title("B站播放器 - API合集支持")
-        self.root.geometry("750x600")
+        self.root.title("B站播放器 - 支持上/下一集")
+        self.root.geometry("750x680")
 
         ok, err = check_dependencies()
         if not ok:
@@ -176,15 +197,35 @@ class BiliPlayer:
         self.hwdec = tk.BooleanVar(value=True)
         self.cookie_source = tk.StringVar(value="none")
         self.cookie_file_path = ""
-        self.entries = []      # (title, play_url)
+        self.entries = []          # (title, play_url)
         self.current_strategy = DEFAULT_STRATEGY.copy()
 
+        # 资源库数据
+        self.playlist_entries = []  # [(name, url)]
+        self.selected_playlist_var = tk.StringVar()
+
+        # 播放状态跟踪
+        self.current_playing_idx = -1   # 当前正在播放的分集索引（-1表示无）
+        self.current_mpv_process = None # 当前 mpv 进程对象
+
         self.create_widgets()
+        self.refresh_playlist()
 
     def create_widgets(self):
-        # URL 行
+        # 资源库区域
+        frame_library = tk.LabelFrame(self.root, text="我的资源库 (playlist.txt)", padx=10, pady=5)
+        frame_library.pack(pady=10, padx=10, fill=tk.X)
+
+        tk.Label(frame_library, text="选择资源:").pack(side=tk.LEFT)
+        self.playlist_combo = ttk.Combobox(frame_library, textvariable=self.selected_playlist_var, width=50, state="readonly")
+        self.playlist_combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.playlist_combo.bind("<<ComboboxSelected>>", self.on_playlist_select)
+
+        tk.Button(frame_library, text="刷新资源库", command=self.refresh_playlist).pack(side=tk.LEFT, padx=5)
+
+        # URL 输入区
         frame_url = tk.Frame(self.root)
-        frame_url.pack(pady=10, padx=10, fill=tk.X)
+        frame_url.pack(pady=5, padx=10, fill=tk.X)
         tk.Label(frame_url, text="B站视频/合集URL:").pack(side=tk.LEFT)
         self.url_entry = tk.Entry(frame_url, width=60)
         self.url_entry.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
@@ -214,24 +255,55 @@ class BiliPlayer:
         # 分集列表
         frame_list = tk.LabelFrame(self.root, text="分集列表 (双击播放)", padx=10, pady=5)
         frame_list.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
-        self.listbox = tk.Listbox(frame_list, height=15, font=("TkFixedFont", 10))
+        self.listbox = tk.Listbox(frame_list, height=12, font=("TkFixedFont", 10))
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar = tk.Scrollbar(frame_list, orient=tk.VERTICAL, command=self.listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox.config(yscrollcommand=scrollbar.set)
         self.listbox.bind("<Double-Button-1>", lambda e: self.play_selected())
 
-        # 控制按钮
+        # 控制按钮区（新增上/下一集）
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
-        self.play_btn = tk.Button(btn_frame, text="播放选中集", command=self.play_selected, bg="#4CAF50", fg="white", width=15)
+        self.prev_btn = tk.Button(btn_frame, text="◀ 上一集", command=self.play_prev, width=10)
+        self.prev_btn.pack(side=tk.LEFT, padx=5)
+        self.play_btn = tk.Button(btn_frame, text="播放选中集", command=self.play_selected, bg="#4CAF50", fg="white", width=12)
         self.play_btn.pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="清空列表", command=self.clear_list, width=15).pack(side=tk.LEFT, padx=5)
+        self.next_btn = tk.Button(btn_frame, text="下一集 ▶", command=self.play_next, width=10)
+        self.next_btn.pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="清空列表", command=self.clear_list, width=10).pack(side=tk.LEFT, padx=5)
 
         # 状态栏
         self.status_var = tk.StringVar(value="就绪")
         status_bar = tk.Label(self.root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def refresh_playlist(self):
+        self.playlist_entries = load_playlist()
+        if not self.playlist_entries:
+            self.playlist_combo['values'] = []
+            self.selected_playlist_var.set("")
+            self.status_var.set("资源库为空，请在同级目录创建 playlist.txt，格式：名称*链接")
+            return
+        names = [name for name, _ in self.playlist_entries]
+        self.playlist_combo['values'] = names
+        if names:
+            self.selected_playlist_var.set(names[0])
+            first_url = self.playlist_entries[0][1]
+            self.url_entry.delete(0, tk.END)
+            self.url_entry.insert(0, first_url)
+            self.status_var.set(f"已加载资源库，共 {len(names)} 个资源")
+        else:
+            self.selected_playlist_var.set("")
+
+    def on_playlist_select(self, event=None):
+        selected_name = self.selected_playlist_var.get()
+        for name, url in self.playlist_entries:
+            if name == selected_name:
+                self.url_entry.delete(0, tk.END)
+                self.url_entry.insert(0, url)
+                self.status_var.set(f"已选择：{name}")
+                break
 
     def toggle_cookie_file(self):
         if self.cookie_source.get() == "file":
@@ -249,6 +321,7 @@ class BiliPlayer:
     def clear_list(self):
         self.listbox.delete(0, tk.END)
         self.entries.clear()
+        self.current_playing_idx = -1
         self.status_var.set("列表已清空")
 
     def update_strategy(self):
@@ -295,7 +368,6 @@ class BiliPlayer:
         def update_status(msg):
             self.root.after(0, lambda: self.status_var.set(msg))
 
-        # 提取 BV 号
         bv_match = re.search(r'BV([a-zA-Z0-9]+)', url)
         if not bv_match:
             update_status("无法提取 BV 号")
@@ -304,7 +376,6 @@ class BiliPlayer:
         bvid = bv_match.group(0)
         update_status(f"正在请求 API: {bvid}")
 
-        # 优先使用 API 获取分P列表
         pages = get_video_pages_from_api(bvid)
         if pages:
             self.entries = [(title, play_url) for title, _, play_url in pages]
@@ -315,10 +386,12 @@ class BiliPlayer:
                     self.listbox.insert(tk.END, display)
                 self.status_var.set(f"加载完成，共 {len(self.entries)} 集")
                 self.load_btn.config(state=tk.NORMAL)
+                # 加载完成后，可以自动启用上/下一集按钮（如果有选集）
+                self.update_nav_buttons_state()
             self.root.after(0, update_listbox)
             return
 
-        # API 失败，回退到 yt-dlp
+        # 回退 yt-dlp
         update_status("API 失败，尝试 yt-dlp...")
         ydl_opts = {'quiet': True, 'extract_flat': False, 'no_warnings': True}
         src = self.cookie_source.get()
@@ -365,32 +438,102 @@ class BiliPlayer:
                 self.listbox.insert(tk.END, display)
             self.status_var.set(f"加载完成，共 {len(entries)} 集")
             self.load_btn.config(state=tk.NORMAL)
+            self.update_nav_buttons_state()
         self.root.after(0, update_listbox)
 
-    def play_selected(self):
-        selection = self.listbox.curselection()
-        if not selection:
-            messagebox.showwarning("提示", "请先选择一集")
+    def update_nav_buttons_state(self):
+        """根据当前分集数量和当前播放索引，启用/禁用上/下一集按钮"""
+        if not self.entries:
+            self.prev_btn.config(state=tk.DISABLED)
+            self.next_btn.config(state=tk.DISABLED)
             return
-        idx = selection[0]
-        if idx >= len(self.entries):
+        # 如果当前没有正在播放的索引，默认允许上一集/下一集？但最好保持禁用，等待用户先选中播放
+        # 为了体验，我们仍然启用，但边界检查在点击时做
+        self.prev_btn.config(state=tk.NORMAL if self.current_playing_idx > 0 else tk.DISABLED)
+        self.next_btn.config(state=tk.NORMAL if self.current_playing_idx >= 0 and self.current_playing_idx < len(self.entries)-1 else tk.DISABLED)
+
+    def kill_current_mpv(self):
+        """终止当前正在运行的 mpv 进程"""
+        if self.current_mpv_process is not None:
+            try:
+                # 尝试优雅终止
+                self.current_mpv_process.terminate()
+                # 等待最多2秒
+                try:
+                    self.current_mpv_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    # 强制杀死
+                    self.current_mpv_process.kill()
+                debug_print("已终止旧的 mpv 进程")
+            except Exception as e:
+                debug_print(f"终止 mpv 进程时出错: {e}")
+            finally:
+                self.current_mpv_process = None
+
+    def play_by_index(self, idx: int):
+        """播放指定索引的分集（不杀死旧进程，先调用 kill_current_mpv）"""
+        if not self.entries:
+            messagebox.showwarning("提示", "没有分集列表，请先加载视频")
+            return
+        if idx < 0 or idx >= len(self.entries):
+            debug_print(f"索引越界: {idx}")
             return
         title, url = self.entries[idx]
         self.status_var.set(f"正在播放: {title}")
         self.update_strategy()
 
-        self.play_btn.config(state=tk.DISABLED)
+        # 先停止当前播放
+        self.kill_current_mpv()
+
+        # 记录新索引
+        self.current_playing_idx = idx
+        self.update_nav_buttons_state()
+
+        # 启动播放（在新线程中）
         def play_thread():
             def status_cb(msg):
                 self.root.after(0, lambda: self.status_var.set(msg))
-            err = play_with_mpv(url, self.current_strategy, status_cb)
-            if err:
-                self.root.after(0, lambda: messagebox.showerror("播放错误", err))
+            proc = play_with_mpv(url, self.current_strategy, status_cb)
+            if proc is None:
+                self.root.after(0, lambda: messagebox.showerror("播放错误", "无法启动 mpv"))
                 self.root.after(0, lambda: self.status_var.set("播放失败"))
+                self.root.after(0, lambda: setattr(self, 'current_playing_idx', -1))
+                self.root.after(0, self.update_nav_buttons_state)
             else:
-                self.root.after(0, lambda: self.status_var.set("播放已启动"))
-            self.root.after(0, lambda: self.play_btn.config(state=tk.NORMAL))
+                self.current_mpv_process = proc
+                # 等待进程结束，以便清理
+                proc.wait()
+                # 进程结束后，如果当前播放索引仍然是这个，则清除状态
+                if self.current_playing_idx == idx:
+                    self.root.after(0, lambda: setattr(self, 'current_mpv_process', None))
+                    self.root.after(0, lambda: setattr(self, 'current_playing_idx', -1))
+                    self.root.after(0, self.update_nav_buttons_state)
+                    self.root.after(0, lambda: self.status_var.set("播放结束"))
+
         threading.Thread(target=play_thread, daemon=True).start()
+
+    def play_selected(self):
+        """播放列表框中选中的项"""
+        selection = self.listbox.curselection()
+        if not selection:
+            messagebox.showwarning("提示", "请先在列表中选择一集")
+            return
+        idx = selection[0]
+        self.play_by_index(idx)
+
+    def play_prev(self):
+        """上一集"""
+        if self.current_playing_idx > 0:
+            self.play_by_index(self.current_playing_idx - 1)
+        else:
+            messagebox.showinfo("提示", "已经是第一集")
+
+    def play_next(self):
+        """下一集"""
+        if self.current_playing_idx >= 0 and self.current_playing_idx < len(self.entries) - 1:
+            self.play_by_index(self.current_playing_idx + 1)
+        else:
+            messagebox.showinfo("提示", "已经是最后一集")
 
 if __name__ == "__main__":
     root = tk.Tk()

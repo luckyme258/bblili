@@ -1,3 +1,8 @@
+test_progress.py 这个功能最全，新加了进度保存
+small.py 这个是最基本
+next_episode.py 这个实现了快速下一集（需要全屏放大，才可以看见）
+test_api.py 这个是测试bili的api
+
 这个是一个借助mpv以及bilibil api 制作的播放器
 适用于将合集收藏到playlist.txt，
 格式 名字*链接
