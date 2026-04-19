@@ -1,3 +1,4 @@
+test_next.py  这个是更新了按钮位置
 test_progress.py 这个功能最全，新加了进度保存
 small.py 这个是最基本
 next_episode.py 这个实现了快速下一集（需要全屏放大，才可以看见）
