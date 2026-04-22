@@ -3,9 +3,8 @@
 - test_api.py 这个是测试bili的api，用来测试api的有效性（加入未来bili改了api）
 
 # 回收站 忽略就好
-- test_progress.py 这个功能最全，新加了进度保存
-- small.py 这个是最基本
-- next_episode.py 这个实现了快速下一集（需要全屏放大，才可以看见）
+- test_progress.py 新加了进度保存（已经更新到主程序）
+- small.py 这个是最基本（备份，大概无用）
 
 # 使用说明
 - 这个是一个借助mpv以及bilibil的api 制作的播放器
