@@ -1,8 +1,9 @@
 # 有效文件
-test_next.py  这个是更新了按钮位置
-test_api.py 这个是测试bili的api
+test_next.py  主程序
 
-# 回收站
+test_api.py 这个是测试bili的api，用来测试api的有效性（加入未来bili改了api）
+
+# 回收站 忽略就好
 test_progress.py 这个功能最全，新加了进度保存
 small.py 这个是最基本
 next_episode.py 这个实现了快速下一集（需要全屏放大，才可以看见）
