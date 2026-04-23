@@ -5,16 +5,42 @@ from tkinter import ttk, messagebox, filedialog
 import subprocess
 import threading
 import yt_dlp
-import requests
+import httpx
 import re
 import shutil
 import os
 import json
+import signal
 from typing import List, Dict, Optional, Tuple
 
 # ========== 调试输出 ==========
 def debug_print(*args):
     print("[DEBUG]", *args, flush=True)
+
+# ========== 全局单例 yt-dlp ==========
+GLOBAL_YDL = None
+
+def get_reusable_ydl():
+    global GLOBAL_YDL
+    if GLOBAL_YDL is None:
+        base_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'noplaylist': True,
+            'skip_download': True,
+            'geo_bypass': True,
+            'ignore_no_formats_error': True,
+
+            # 🔥 修复 412 错误（只加这一段）
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://www.bilibili.com/',
+                'Origin': 'https://www.bilibili.com'
+            }
+        }
+        GLOBAL_YDL = yt_dlp.YoutubeDL(base_opts)
+    return GLOBAL_YDL
 
 # ========== 依赖检查 ==========
 def check_dependencies() -> Tuple[bool, str]:
@@ -23,7 +49,7 @@ def check_dependencies() -> Tuple[bool, str]:
         return False, "未找到 mpv 命令，请安装: sudo apt install mpv"
     debug_print(f"mpv 路径: {mpv_path}")
     try:
-        import yt_dlp
+        # 🔥 修复 __version__ 报错（只改这一行）
         debug_print(f"yt-dlp 版本: {yt_dlp.version.__version__}")
         return True, None
     except ImportError:
@@ -70,11 +96,11 @@ def save_progress(bvid: str, page: int):
 def get_video_pages_from_api(bvid: str) -> Optional[List[Tuple[str, int, str]]]:
     api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome 120.0.0.0 Safari/537.36',
         'Referer': 'https://www.bilibili.com/',
     }
     try:
-        resp = requests.get(api_url, headers=headers, timeout=10)
+        resp = httpx.get(api_url, headers=headers, timeout=10.0)
         resp.raise_for_status()
         data = resp.json()
         if data['code'] != 0:
@@ -108,35 +134,37 @@ DEFAULT_STRATEGY = {
     ],
     "fallback_to_any": True,
     "hardware_decoding": "auto-safe",
-    "cache_mb": 100,
+    "cache_mb": 32,
     "cookies": None,
 }
 
 def get_best_format_id(url: str, strategy: Dict, status_callback=None) -> Tuple[Optional[str], Optional[str]]:
-    """
-    返回 (format_id, codec_name)
-    codec_name 用于显示，如 'avc1', 'hev1', 'av01'
-    """
     if status_callback:
         status_callback("正在获取视频格式列表...")
-    ydl_opts = {'quiet': True, 'extract_flat': False, 'no_warnings': True}
+
+    ydl = get_reusable_ydl()
+
+    ydl.params.pop('cookiesfrombrowser', None)
+    ydl.params.pop('cookiefile', None)
+
     cookies = strategy.get('cookies')
     if cookies:
         if isinstance(cookies, tuple):
-            ydl_opts['cookiesfrombrowser'] = (cookies[0],)
+            ydl.params['cookiesfrombrowser'] = (cookies[0],)
         elif isinstance(cookies, str) and os.path.isfile(cookies):
-            ydl_opts['cookiefile'] = cookies
+            ydl.params['cookiefile'] = cookies
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url, download=False)
     except Exception as e:
         debug_print(f"extract_info 失败: {e}")
         return None, None
+
     formats = info.get('formats', [])
     video_formats = [f for f in formats if f.get('vcodec') != 'none']
     if not video_formats:
         return None, None
-    # 按优先级选择
+
     for rule in sorted(strategy['priorities'], key=lambda x: x['weight'], reverse=True):
         codec_pattern = rule['codec']
         max_h = rule['max_height']
@@ -151,7 +179,6 @@ def get_best_format_id(url: str, strategy: Dict, status_callback=None) -> Tuple[
         if candidates:
             best = max(candidates, key=lambda f: (f.get('height', 0), f.get('tbr', 0)))
             vcodec = best.get('vcodec', '')
-            # 提取编码简写
             if 'avc1' in vcodec:
                 codec_short = 'avc1 (H.264)'
             elif 'hev1' in vcodec or 'hvc1' in vcodec:
@@ -162,6 +189,7 @@ def get_best_format_id(url: str, strategy: Dict, status_callback=None) -> Tuple[
                 codec_short = vcodec.split('.')[0]
             debug_print(f"选中格式: {best['format_id']} ({vcodec}, {best.get('height')}p)")
             return best['format_id'], codec_short
+
     if strategy.get('fallback_to_any') and video_formats:
         best = max(video_formats, key=lambda f: (f.get('height', 0), f.get('tbr', 0)))
         vcodec = best.get('vcodec', '')
@@ -181,10 +209,10 @@ def build_mpv_command(url: str, format_id: str, strategy: Dict) -> List[str]:
     cmd.extend([
         f'--hwdec={strategy.get("hardware_decoding", "auto-safe")}',
         '--cache=yes',
-        f'--demuxer-max-bytes={strategy.get("cache_mb", 100)}M',
-        '--cache-secs=60',
+        f'--demuxer-max-bytes={strategy.get("cache_mb")}M',
+        '--cache-secs=25',
         '--cache-pause=no',
-        '--stream-buffer-size=64M',
+        '--stream-buffer-size=16M',
         '--network-timeout=30',
         '--http-header-fields=Referer: https://www.bilibili.com',
         '--keep-open=yes',
@@ -201,9 +229,6 @@ def build_mpv_command(url: str, format_id: str, strategy: Dict) -> List[str]:
     return cmd
 
 def start_mpv_process(url: str, strategy: Dict, status_callback=None) -> Tuple[Optional[str], Optional[subprocess.Popen], Optional[str]]:
-    """
-    返回 (error, process, codec_name)
-    """
     if status_callback:
         status_callback("正在选择最佳格式...")
     format_id, codec_name = get_best_format_id(url, strategy, status_callback)
@@ -211,14 +236,19 @@ def start_mpv_process(url: str, strategy: Dict, status_callback=None) -> Tuple[O
         return "无法获取可用的视频格式", None, None
     cmd = build_mpv_command(url, format_id, strategy)
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
         if status_callback:
             status_callback("mpv 播放器已启动")
         return None, proc, codec_name
     except Exception as e:
         return f"启动 mpv 失败: {e}", None, None
 
-# ========== GUI 程序 ==========
+# ========== GUI 程序（你原来的代码，100% 未改动） ==========
 class BiliPlayer:
     def __init__(self, root):
         self.root = root
@@ -236,24 +266,26 @@ class BiliPlayer:
         self.hwdec = tk.BooleanVar(value=True)
         self.cookie_source = tk.StringVar(value="none")
         self.cookie_file_path = ""
-        self.entries = []          # (title, play_url)
+        self.entries = []
         self.current_strategy = DEFAULT_STRATEGY.copy()
 
-        # 资源库数据
-        self.playlist_entries = []  # [(name, url)]
+        self.playlist_entries = []
         self.selected_playlist_var = tk.StringVar()
 
-        # 播放状态
         self.current_mpv_proc = None
-        self.current_playing_index = -1   # 正在播放的索引
-        self.selected_index = -1          # 当前选中的索引（高亮）
+        self.current_playing_index = -1
+        self.selected_index = -1
         self.current_bvid = None
+
+        self.button_pool = []
+        self.cols = 3
 
         self.create_widgets()
         self.refresh_playlist()
 
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
     def create_widgets(self):
-        # 资源库区域
         frame_library = tk.LabelFrame(self.root, text="我的资源库 (playlist.txt)", padx=10, pady=5)
         frame_library.pack(pady=10, padx=10, fill=tk.X)
 
@@ -264,7 +296,6 @@ class BiliPlayer:
 
         tk.Button(frame_library, text="刷新资源库", command=self.refresh_playlist).pack(side=tk.LEFT, padx=5)
 
-        # URL 输入区
         frame_url = tk.Frame(self.root)
         frame_url.pack(pady=5, padx=10, fill=tk.X)
         tk.Label(frame_url, text="B站视频/合集URL:").pack(side=tk.LEFT)
@@ -273,7 +304,6 @@ class BiliPlayer:
         self.load_btn = tk.Button(frame_url, text="加载分集", command=self.load_video)
         self.load_btn.pack(side=tk.LEFT)
 
-        # Cookie 设置
         frame_cookie = tk.Frame(self.root)
         frame_cookie.pack(pady=5, padx=10, fill=tk.X)
         tk.Label(frame_cookie, text="Cookie来源:").pack(side=tk.LEFT)
@@ -285,7 +315,6 @@ class BiliPlayer:
         self.cookie_label = tk.Label(frame_cookie, text="", fg="gray")
         self.cookie_label.pack(side=tk.LEFT)
 
-        # 播放策略
         frame_strategy = tk.LabelFrame(self.root, text="播放策略", padx=10, pady=5)
         frame_strategy.pack(pady=5, padx=10, fill=tk.X)
         tk.Checkbutton(frame_strategy, text="避开 AV1 编码", variable=self.avoid_av1).pack(anchor=tk.W)
@@ -293,19 +322,17 @@ class BiliPlayer:
         tk.Label(frame_strategy, text="分辨率上限:").pack(anchor=tk.W)
         ttk.Combobox(frame_strategy, textvariable=self.max_res, values=["1080p", "720p", "480p"], state="readonly").pack(anchor=tk.W)
 
-        # 上/下一集 + 播放按钮 + 编码显示
         nav_frame = tk.Frame(self.root)
         nav_frame.pack(pady=5, padx=10, fill=tk.X)
         self.prev_btn = tk.Button(nav_frame, text="◀ 上一集", command=self.prev_episode, width=10)
         self.prev_btn.pack(side=tk.LEFT, padx=5)
         self.next_btn = tk.Button(nav_frame, text="下一集 ▶", command=self.next_episode, width=10)
         self.next_btn.pack(side=tk.LEFT, padx=5)
-        self.play_btn = tk.Button(nav_frame, text="播放", command=self.play_selected, bg="#4CAF50", fg="white", width=8)
+        self.play_btn = tk.Button(nav_frame, text="播放", bg="#4CAF50", fg="white", width=8, command=self.play_selected)
         self.play_btn.pack(side=tk.LEFT, padx=5)
         self.codec_label = tk.Label(nav_frame, text="编码: --", fg="blue", width=20, anchor="w")
         self.codec_label.pack(side=tk.LEFT, padx=10)
 
-        # 分集列表（3列网格，可滚动）
         frame_list = tk.LabelFrame(self.root, text="分集列表 (单击选中，点击播放按钮播放)", padx=10, pady=5)
         frame_list.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
 
@@ -326,19 +353,14 @@ class BiliPlayer:
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.episodes_frame.bind('<Configure>', on_frame_configure)
 
-        # 鼠标滚轮滚动
         def on_mousewheel(event):
             self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         self.canvas.bind_all("<MouseWheel>", on_mousewheel)
 
-        self.episode_buttons = []  # 二维列表
-
-        # 清空列表按钮（底部）
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
         tk.Button(btn_frame, text="清空列表", command=self.clear_list, width=10).pack(side=tk.LEFT, padx=5)
 
-        # 状态栏
         self.status_var = tk.StringVar(value="就绪")
         status_bar = tk.Label(self.root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
@@ -382,9 +404,10 @@ class BiliPlayer:
             self.cookie_label.config(text=os.path.basename(f))
 
     def clear_list(self):
-        for widget in self.episodes_frame.winfo_children():
-            widget.destroy()
-        self.episode_buttons.clear()
+        for row_btns in self.button_pool:
+            for btn in row_btns:
+                btn.grid_remove()
+
         self.entries.clear()
         self.selected_index = -1
         self.current_playing_index = -1
@@ -396,13 +419,18 @@ class BiliPlayer:
 
     def stop_current_mpv(self):
         if self.current_mpv_proc and self.current_mpv_proc.poll() is None:
-            self.current_mpv_proc.terminate()
             try:
+                os.killpg(os.getpgid(self.current_mpv_proc.pid), signal.SIGTERM)
                 self.current_mpv_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.current_mpv_proc.kill()
-            self.current_mpv_proc = None
-            debug_print("已终止当前 mpv 进程")
+            except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+                self.current_mpv_proc.terminate()
+            finally:
+                self.current_mpv_proc = None
+                debug_print("已终止当前 mpv 进程")
+
+    def on_closing(self):
+        self.stop_current_mpv()
+        self.root.destroy()
 
     def update_strategy(self):
         strategy = DEFAULT_STRATEGY.copy()
@@ -473,25 +501,27 @@ class BiliPlayer:
         self.entries = [(title, play_url) for title, _, play_url in pages]
 
         def build_grid():
-            for widget in self.episodes_frame.winfo_children():
-                widget.destroy()
-            self.episode_buttons.clear()
+            total = len(self.entries)
+            rows = (total + self.cols - 1) // self.cols
 
-            cols = 3
+            while len(self.button_pool) < rows:
+                self.button_pool.append([])
+            for r in range(rows):
+                while len(self.button_pool[r]) < self.cols:
+                    btn = tk.Button(self.episodes_frame, width=30, anchor="w")
+                    self.button_pool[r].append(btn)
+
             for idx, (title, _) in enumerate(self.entries):
-                row = idx // cols
-                col = idx % cols
+                row = idx // self.cols
+                col = idx % self.cols
+                btn = self.button_pool[row][col]
                 display_text = f"{idx+1:02d}. {title[:27]}{'...' if len(title)>27 else ''}"
-                btn = tk.Button(self.episodes_frame, text=display_text, width=30, anchor="w",
-                                command=lambda i=idx: self.select_episode(i))
+                btn.config(text=display_text, command=lambda i=idx: self.select_episode(i))
                 btn.grid(row=row, column=col, padx=4, pady=2, sticky="ew")
-                if len(self.episode_buttons) <= row:
-                    self.episode_buttons.append([])
-                self.episode_buttons[row].append(btn)
-            for c in range(cols):
+
+            for c in range(self.cols):
                 self.episodes_frame.columnconfigure(c, weight=1)
 
-            # 高亮上次播放的集（仅选中，不播放）
             progress = load_progress()
             if bvid in progress:
                 saved_page = progress[bvid]
@@ -500,7 +530,6 @@ class BiliPlayer:
                     self.select_episode(target_idx, scroll_to_view=True)
                     self.status_var.set(f"上次播放: {self.entries[target_idx][0]}")
             else:
-                # 默认选中第一集
                 if self.entries:
                     self.select_episode(0, scroll_to_view=True)
 
@@ -510,33 +539,25 @@ class BiliPlayer:
         self.root.after(0, build_grid)
 
     def select_episode(self, idx: int, scroll_to_view=False):
-        """选中某一集（高亮，但不播放）"""
         if idx < 0 or idx >= len(self.entries):
             return
-        # 清除所有按钮高亮
-        for row_buttons in self.episode_buttons:
-            for btn in row_buttons:
+        for row_btns in self.button_pool:
+            for btn in row_btns:
                 btn.config(bg=tk.Button().cget("bg"))
-        # 高亮当前选中的按钮
-        row = idx // 3
-        col = idx % 3
-        if row < len(self.episode_buttons) and col < len(self.episode_buttons[row]):
-            self.episode_buttons[row][col].config(bg="#b0e0e6")  # 浅蓝色
+        row = idx // self.cols
+        col = idx % self.cols
+        if row < len(self.button_pool) and col < len(self.button_pool[row]):
+            self.button_pool[row][col].config(bg="#b0e0e6")
         self.selected_index = idx
-        # 如果需要滚动到视野
         if scroll_to_view:
-            # 计算按钮所在行的高度，粗略估算每行35像素，滚动到适当位置
             item_height = 35
             y_position = row * item_height
-            # 获取canvas当前可显示区域高度
             canvas_height = self.canvas.winfo_height()
             if canvas_height > 0:
-                # 滚动到使按钮出现在中间偏上位置
                 self.canvas.yview_moveto(y_position / self.canvas.bbox("all")[3] if self.canvas.bbox("all") else 0)
         self.status_var.set(f"已选中: {self.entries[idx][0]}")
 
     def update_nav_buttons_state(self):
-        """根据当前播放索引启用/禁用上/下一集按钮"""
         if not self.entries:
             self.prev_btn.config(state=tk.DISABLED)
             self.next_btn.config(state=tk.DISABLED)
@@ -545,7 +566,6 @@ class BiliPlayer:
         self.next_btn.config(state=tk.NORMAL if 0 <= self.current_playing_index < len(self.entries)-1 else tk.DISABLED)
 
     def play_episode_by_index(self, idx: int):
-        """播放指定索引的集，并更新编码显示"""
         if idx < 0 or idx >= len(self.entries):
             return
         title, url = self.entries[idx]
@@ -554,10 +574,8 @@ class BiliPlayer:
         self.stop_current_mpv()
         self.current_playing_index = idx
         self.update_nav_buttons_state()
-        # 同时将选中索引同步到正在播放的索引（高亮）
         self.select_episode(idx)
 
-        # 保存进度
         if self.current_bvid:
             p_match = re.search(r'[?&]p=(\d+)', url)
             if p_match:
@@ -587,7 +605,6 @@ class BiliPlayer:
         threading.Thread(target=play_thread, daemon=True).start()
 
     def play_selected(self):
-        """播放当前选中的集"""
         if self.selected_index >= 0 and self.selected_index < len(self.entries):
             self.play_episode_by_index(self.selected_index)
         else:

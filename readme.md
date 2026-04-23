@@ -1,10 +1,12 @@
 # 有效文件
-- test_next.py  主程序
-- test_api.py 这个是测试bili的api，用来测试api的有效性（加入未来bili改了api）
-
+- test_next_01.py  主程序
+- test_api.py 这个是测试bili的api，用来测试api的有效性（假如未来bili改了api）
+- cookies.txt 是通过浏览器插件得到的
+- playlist.txt 这个是自定义的播放列表
 # 回收站 忽略就好
 - test_progress.py 新加了进度保存（已经更新到主程序）
 - small.py 这个是最基本（备份，大概无用）
+- test_next.py 曾经用了五天，很好用，但是似乎被检测到了
 
 # 使用说明
 - 这个是一个借助mpv以及bilibil的api 制作的播放器
